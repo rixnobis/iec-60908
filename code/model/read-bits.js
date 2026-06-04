@@ -432,7 +432,11 @@ async function main() {
   const sectorLogError = verboseSectorLogError ? console.log : x => x
 
   const poly = require('jqr-poly')
-  const gf = require('jqr-gf')
+  // Use the centralized patched field (see gf-patched.js). Requiring jqr-gf
+  // directly here would miss the sub and div fixes, and the decoder is exactly
+  // the path that needs div (Forney error-magnitude computation).
+  const gf = require('./gf-patched')
+  const rsdecode = require('./rs-decode')
 
   for (let i = 2; i < sectors.length; i++) {
     sectorLog()
@@ -686,32 +690,43 @@ async function main() {
     // byte at that position, or set it if a value is provided. It's a bit of a
     // virtual array accessor, considering the data as an infinite number of rows
     // for 32 columns, hopping around the data, c1, and c2 fields.
-    const delayedByte = (delay, row, column, value) => {
+    // Resolve a (delay, row, column) triple to a concrete storage location:
+    // which sector, which field (data / c1 / c2), and the index within it.
+    const resolveLoc = (delay, row, column) => {
       let sectorNumber = i
       while (row < delay) {
         sectorNumber--
         delay -= 98
       }
       row -= delay
-
-      if (column < 12) {
-        const idx = 24 * row + column
-        if (value !== undefined) sectors[sectorNumber].data[idx] = value
-        return sectors[sectorNumber].data[idx]
-      } else if (column < 16) {
-        const idx = 4 * row + column - 12
-        if (value !== undefined) sectors[sectorNumber].c2[idx] = value
-        return sectors[sectorNumber].c2[idx]
-      } else if (column < 28) {
-        const idx = 24 * row + column - 4
-        if (value !== undefined) sectors[sectorNumber].data[idx] = value
-        return sectors[sectorNumber].data[idx]
-      } else {
-        const idx = 4 * row + column - 28
-        if (value !== undefined) sectors[sectorNumber].c1[idx] = value
-        return sectors[sectorNumber].c1[idx]
-      }
+      if (column < 12) return { field: 'data', sectorNumber, idx: 24 * row + column }
+      if (column < 16) return { field: 'c2', sectorNumber, idx: 4 * row + column - 12 }
+      if (column < 28) return { field: 'data', sectorNumber, idx: 24 * row + column - 4 }
+      return { field: 'c1', sectorNumber, idx: 4 * row + column - 28 }
     }
+
+    const delayedByte = (delay, row, column, value) => {
+      const { field, sectorNumber, idx } = resolveLoc(delay, row, column)
+      if (value !== undefined) sectors[sectorNumber][field][idx] = value
+      return sectors[sectorNumber][field][idx]
+    }
+
+    // Cross-line erasure pointers. A physical data symbol is covered by BOTH a
+    // C1 codeword and a C2 codeword (that is what the interleave buys: two
+    // errors that collide in one C1 row land in different C2 diagonals). When
+    // one line cannot trust a symbol it records that symbol's storage location
+    // here; the other line, reading the same physical symbol through the
+    // de-interleave, then treats it as an erasure. An erasure costs 1 toward the
+    // 2*errors + erasures <= 4 budget where an unflagged error costs 2, so the
+    // pointer lets the partner line resolve a collision it could not alone.
+    const erasurePointers = new Set()
+    const locKey = (delay, row, column) => {
+      const { field, sectorNumber, idx } = resolveLoc(delay, row, column)
+      return field + ':' + sectorNumber + ':' + idx
+    }
+    const flagErasure = (delay, row, column) => erasurePointers.add(locKey(delay, row, column))
+    const clearErasure = (delay, row, column) => erasurePointers.delete(locKey(delay, row, column))
+    const isErasureFlagged = (delay, row, column) => erasurePointers.has(locKey(delay, row, column))
 
     for (let r = 0; r < 98; r++) {
       // We start with processing C1, gathering all of the data for it, and
@@ -725,87 +740,49 @@ async function main() {
       // would need to be reworked to do this properly to account for
       // this time-traveling aspect of the data.
       {
-        const syndromes = []
+        // Gather the 32 C1 symbols in codeword order. A symbol is an erasure if
+        // the EFM layer could not read it (negative) OR a prior pass flagged its
+        // physical location as untrustworthy. Use 0 as a placeholder value.
         const coeffs = []
-        const erasures = []
-        const erratas = []
-        let gotError = false
+        const erasureIdx = []
         for (let b = 0; b < 32; b++) {
           // The delay for C1 is luckily simple: it's either 0 or 1, depending
           // on the column's parity.
           const v = delayedByte(b % 2, r, b)
-          if (v < 0) {
-            coeffs[b] = 0
-            erasures.push(gf.exp(31 - b))
-            erratas.push(b)
+          if (v < 0 || isErasureFlagged(b % 2, r, b)) {
+            coeffs[b] = v < 0 ? 0 : v
+            erasureIdx.push(b)
           } else {
             coeffs[b] = v
           }
         }
-        // Fairly certain the jqf.poly library is buggy, and that sometimes,
-        // it will result in the wrong evaluation. I've somewhat narrowed it
-        // down to when one of the recovery bytes have 0s in them, and I
-        // think the library is taking the wrong shortcut as a result, but
-        // I'm not exactly in the mood for fishing for this. This means this
-        // may rarely yield false negatives. Same with the C2 calculation
-        // below.
-        const polynomial = poly.create(coeffs, gf)
-        let e = 1
-        for (let s = 0; s < 4; s++) {
-          const syndrome = polynomial.evaluate(e)
-          if (syndrome !== 0) gotError = true
-          syndromes.push(syndrome)
-          e *= 2
-        }
-        if (gotError) {
+        // Decode C1 conservatively: correct at most one error. A two-error
+        // correction in a distance-5 code is right at the decoding radius and
+        // can silently alias to a wrong-but-valid codeword (a miscorrection
+        // that passes its own syndrome check). When C1 sees more than it will
+        // trust, it flags instead, handing the positions to C2 as erasures,
+        // where decoding is by-location and cannot alias.
+        const result = rsdecode.decode(coeffs, erasureIdx, 4, 1)
+        if (result === null) {
+          // C1 cannot (or will not) resolve this codeword. Hand every symbol to
+          // C2 as an erasure pointer: each lands in a different C2 diagonal,
+          // where it costs only 1 toward the budget and C2 may resolve it.
           sectorLogError(
-            'C1 sector: ' + i + ', row: ' + r + ', syndromes: ' + syndromes
+            'C1 sector: ' + i + ', row: ' + r + ', uncorrectable; flagging 32 erasure pointers for C2'
           )
-          sectorLogError('C1 corrupted data: ' + coeffs)
-          const hcoeffs = []
-          for (let i = 0; i < coeffs.length; i++) {
-            hcoeffs[i] = tohex(coeffs[i])
-          }
-          sectorLogError('C1 corrupted data: ' + hcoeffs)
-          const originalSyndromes = [...syndromes]
-          erasures.forEach(e => {
-            for (let s = 0; s < syndromes.length - 1; s++) {
-              syndromes[s] = gf.mul(syndromes[s], e) ^ syndromes[s + 1]
-            }
-          })
-          sectorLogError('C1 Forney syndromes: ' + syndromes)
-          let locator = poly.create([1], gf)
-          let old = poly.create([1], gf)
-          for (let K = 0; K < 4 - erasures.length; K++) {
-            let delta = syndromes[K]
-            for (let l = 0; l < locator.getDegree(); l++) {
-              const c = locator.getCoefficient(locator.getDegree() - l)
-              const s = syndromes[K - l - 1]
-              const m = gf.mul(c, s)
-              delta = gf.add(delta, m)
-            }
-            old = old.multiplyByMonomial(1, 1)
-            if (delta !== 0) {
-              if (old.getDegree() > locator.getDegree()) {
-                const t = old.multiplyScalar(delta)
-                old = locator.multiplyScalar(gf.inv(delta))
-                locator = t
-              }
-              locator = locator.add(old.multiplyScalar(delta))
+          for (let b = 0; b < 32; b++) flagErasure(b % 2, r, b)
+        } else {
+          if (result.errataIdx.length > 0) {
+            sectorLogError(
+              'C1 sector: ' + i + ', row: ' + r + ', corrected ' +
+              result.errataIdx.length + ' symbol(s) at columns ' + result.errataIdx
+            )
+            for (const b of result.errataIdx) {
+              delayedByte(b % 2, r, b, result.corrected[b])
             }
           }
-          // TODO: Apply error correction here. At this point, the math becomes horrendous,
-          // and I don't have the patience to do it. Furthermore, the jqr-gf library is
-          // buggy, and it fails to perform the math for it properly. Plus, see the comment
-          // at the top of this loop about time travel. At least we can see the errors.
-          sectorLogError('C1 Locator: ' + locator.getCoefficients())
-          let e = 1
-          for (let p = 31; p >= 0; p--) {
-            const r = locator.evaluate(e)
-            if (r === 0) erratas.push(p)
-            e *= 2
-          }
-          sectorLogError('C1 Erratas: ' + erratas)
+          // Codeword is now trusted: clear any stale pointers on its symbols.
+          for (let b = 0; b < 32; b++) clearErasure(b % 2, r, b)
         }
       }
 
@@ -815,79 +792,44 @@ async function main() {
       // the above, so this is technically copy/pasted. I avoided factorizing
       // this however for clarity.
       {
-        const syndromes = []
+        // C2 is a (28,24) code. Its delayed-line pattern is not a simple parity
+        // like C1's, so the column-to-delay mapping is hardcoded below. The
+        // decode itself is identical: gather, decode errors-and-erasures, write
+        // repaired symbols back through the accessor.
         const coeffs = []
-        const erasures = []
-        const erratas = []
-        let gotError = false
+        const erasureIdx = []
         const delayed = [
           107, 104, 99, 96, 91, 88, 83, 80, 75, 72, 67, 64, 59, 56, 51, 48, 43,
           40, 35, 32, 27, 24, 19, 16, 11, 8, 3, 0
         ]
         for (let b = 0; b < 28; b++) {
           const v = delayedByte(delayed[b], r, b)
-          if (v < 0) {
-            coeffs[b] = 0
-            erasures.push(gf.exp(31 - b))
-            erratas.push(b)
+          // Erasure if EFM-unreadable OR flagged by C1's pass on the same
+          // physical symbol. The latter is the cooperative pointer.
+          if (v < 0 || isErasureFlagged(delayed[b], r, b)) {
+            coeffs[b] = v < 0 ? 0 : v
+            erasureIdx.push(b)
           } else {
             coeffs[b] = v
           }
         }
-        const polynomial = poly.create(coeffs, gf)
-        let e = 1
-        for (let s = 0; s < 4; s++) {
-          const syndrome = polynomial.evaluate(e)
-          if (syndrome !== 0) gotError = true
-          syndromes.push(syndrome)
-          e *= 2
-        }
-        if (gotError) {
+        const result = rsdecode.decode(coeffs, erasureIdx, 4)
+        if (result === null) {
           sectorLogError(
-            'C2 sector: ' + i + ', row: ' + r + ', syndromes: ' + syndromes
+            'C2 sector: ' + i + ', row: ' + r + ', uncorrectable (errata exceed budget)'
           )
-          sectorLogError('C2 corrupted data: ' + coeffs)
-          const hcoeffs = []
-          for (let i = 0; i < coeffs.length; i++) {
-            hcoeffs[i] = tohex(coeffs[i])
-          }
-          sectorLogError('C2 corrupted data: ' + hcoeffs)
-          const originalSyndromes = [...syndromes]
-          erasures.forEach(e => {
-            for (let s = 0; s < syndromes.length - 1; s++) {
-              syndromes[s] = gf.mul(syndromes[s], e) ^ syndromes[s + 1]
-            }
-          })
-          sectorLogError('C2 Forney syndromes: ' + syndromes)
-          let locator = poly.create([1], gf)
-          let old = poly.create([1], gf)
-          for (let K = 0; K < 4 - erasures.length; K++) {
-            let delta = syndromes[K]
-            for (let l = 0; l < locator.getDegree(); l++) {
-              const c = locator.getCoefficient(locator.getDegree() - l)
-              const s = syndromes[K - l - 1]
-              const m = gf.mul(c, s)
-              delta = gf.add(delta, m)
-            }
-            old = old.multiplyByMonomial(1, 1)
-            if (delta !== 0) {
-              if (old.getDegree() > locator.getDegree()) {
-                const t = old.multiplyScalar(delta)
-                old = locator.multiplyScalar(gf.inv(delta))
-                locator = t
-              }
-              locator = locator.add(old.multiplyScalar(delta))
+        } else {
+          if (result.errataIdx.length > 0) {
+            sectorLogError(
+              'C2 sector: ' + i + ', row: ' + r + ', corrected ' +
+              result.errataIdx.length + ' symbol(s) at columns ' + result.errataIdx
+            )
+            for (const b of result.errataIdx) {
+              delayedByte(delayed[b], r, b, result.corrected[b])
             }
           }
-          // TODO: correct errors. See the comment in C1's algorithm.
-          sectorLogError('C2 Locator: ' + locator.getCoefficients())
-          let e = 1
-          for (let p = 31; p >= 0; p--) {
-            const r = locator.evaluate(e)
-            if (r === 0) erratas.push(p)
-            e *= 2
-          }
-          sectorLogError('C2 Erratas: ' + erratas)
+          // Symbols resolved by C2 are trusted now; clear their pointers.
+          for (let b = 0; b < 28; b++) clearErasure(delayed[b], r, b)
         }
       }
 

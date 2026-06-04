@@ -5,11 +5,10 @@
 // the generic encoder based off dynamic generators will badly pad the
 // output message. This comment is duplicated later in this file.
 const poly = require('jqr-poly')
-const gf = require('jqr-gf')
-
-// The division will try to call sub from the field, but it's not defined.
-// Luckily, it's easy to remedy this problem.
-gf.sub = gf.add
+// gf-patched centralizes the jqr-gf monkey-patches (sub, and the div modulo
+// fix) so the encoder here and the decoder in read-bits.js share one corrected
+// field. See gf-patched.js for the rationale.
+const gf = require('./gf-patched')
 
 /* This code provides four Reed Solomon encoders. One very generic, that will output
    parity bytes that belong at the end of the input stream, for any number of
