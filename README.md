@@ -340,6 +340,11 @@ bytes have been used, but since the EFM decoder can also detect invalid
 sequences of bits, this is an added information sent to the Reed Solomon
 decoder known as "erasures", and can end up correcting more bytes as
 a result.
+ - Since C1 covers C2, errors detected by C1 can also be used as erasures
+when processing C2, thus enabling the recovery of more bytes than a single
+code might be able to provide. This is how CD drive DSPs are able to
+recover a lot of damaged data still when reading scratched discs, by using
+a mixture of the general Reed Solomon recovery and erasure propagation.
 
 ### Delayed patterns and swizzle
 The way the data is organized is very messy in terms of look up tables,
